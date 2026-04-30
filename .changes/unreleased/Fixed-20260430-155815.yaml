@@ -1,3 +1,0 @@
-kind: Fixed
-body: Prevent tag releases from failing when extension.toml already contains the release version
-time: 2026-04-30T15:58:15.342114553+10:00

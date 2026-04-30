@@ -1,3 +1,0 @@
-kind: Fixed
-body: Require changie fragments for deletions, guard release tag moves against stale remote refs, tighten release tag validation, and skip bot-triggered release reruns
-time: 2026-04-30T15:58:14.336337524+10:00

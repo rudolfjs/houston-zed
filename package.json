@@ -1,6 +1,6 @@
 {
   "name": "houston-zed",
-  "version": "0.1.1",
+  "version": "0.1.0",
   "private": true,
   "description": "Build tooling for the Houston theme port to Zed",
   "type": "module",
