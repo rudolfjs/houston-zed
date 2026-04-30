@@ -1,0 +1,7 @@
+id = "houston-theme"
+name = "Houston"
+version = "0.1.1"
+schema_version = 1
+authors = ["github.com/rudolfjs"]
+description = "Houston theme by Astro — cool blues, minty greens, and soft purples — ported to Zed."
+repository = "https://github.com/rudolfjs/houston-zed"

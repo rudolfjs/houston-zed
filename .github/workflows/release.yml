@@ -1,0 +1,191 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: changelog + GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ !endsWith(github.actor, '[bot]') }}
+
+    steps:
+      - name: Verify release app configuration
+        env:
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$RELEASE_APP_ID" ]; then
+            echo "::error::Missing repository variable RELEASE_APP_ID."
+            exit 1
+          fi
+
+          if [ -z "$RELEASE_APP_PRIVATE_KEY" ]; then
+            echo "::error::Missing repository secret RELEASE_APP_PRIVATE_KEY."
+            exit 1
+          fi
+
+      - name: Generate release app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: houston-zed
+
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Verify tag points to a commit on main
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::Release tags must point to commits already on main."
+            exit 1
+          fi
+
+      - name: Resolve release version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          semver_regex='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          if [ "$version" = "$TAG" ] || ! printf '%s' "$version" | grep -Eq "$semver_regex"; then
+            echo "::error::Release tags must look like v1.2.3 or v1.2.3-rc.1."
+            exit 1
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Detect changelog state
+        id: changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          has_unreleased="$(find .changes/unreleased -maxdepth 1 -type f ! -name '.gitkeep' -print -quit 2>/dev/null || true)"
+          has_batched=""
+          if [ -f ".changes/${VERSION}.md" ]; then
+            has_batched="true"
+          fi
+
+          if [ -z "$has_unreleased" ] && [ -z "$has_batched" ]; then
+            echo "::error::No unreleased changelog entries or pre-batched .changes/${VERSION}.md file found. Nothing to release."
+            exit 1
+          fi
+
+          if [ -n "$has_unreleased" ] && [ -n "$has_batched" ]; then
+            echo "::error::Both unreleased fragments and .changes/${VERSION}.md exist. Refusing to re-batch and overwrite the existing file."
+            echo "::error::Merge the fragments into .changes/${VERSION}.md/CHANGELOG.md or delete fragments that should not ship in this release."
+            exit 1
+          fi
+
+          if [ -n "$has_unreleased" ]; then
+            echo "needs_batch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_batch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install changie
+        if: steps.changelog.outputs.needs_batch == 'true'
+        uses: miniscruff/changie-action@v2
+        with:
+          version: latest
+
+      - name: Batch and merge changelog
+        if: steps.changelog.outputs.needs_batch == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          changie batch "$VERSION"
+          changie merge
+
+      - name: Prepare release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          release_notes_path=".changes/${VERSION}.md"
+          if [ ! -s "$release_notes_path" ]; then
+            echo "::error::Could not find release notes at ${release_notes_path}."
+            exit 1
+          fi
+
+          cp "$release_notes_path" "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          prerelease_flag=""
+          if printf '%s' "$VERSION" | grep -Eq '[.-](alpha|beta|rc|pre|dev)'; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file "${RUNNER_TEMP}/release-notes.md" $prerelease_flag
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file "${RUNNER_TEMP}/release-notes.md" --verify-tag $prerelease_flag
+          fi
+
+      - name: Sync package and extension versions
+        id: sync-version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          node scripts/sync-release-version.mjs "$VERSION"
+
+          if git diff --quiet -- package.json extension.toml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit release updates
+        if: steps.changelog.outputs.needs_batch == 'true' || steps.sync-version.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .changes/ CHANGELOG.md package.json extension.toml
+          git commit -m "chore: update release files for ${TAG}"
+          git push origin HEAD:main
+
+      - name: Move tag to include release commit
+        if: steps.changelog.outputs.needs_batch == 'true' || steps.sync-version.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          remote_ref_sha="$(git ls-remote --tags --refs origin "refs/tags/$TAG" | awk '{print $1}')"
+          if [ -z "$remote_ref_sha" ]; then
+            echo "::error::Remote tag $TAG does not exist."
+            exit 1
+          fi
+
+          remote_peeled_sha="$(git ls-remote --tags origin "refs/tags/$TAG^{}" | awk '{print $1}')"
+          remote_target_sha="${remote_peeled_sha:-$remote_ref_sha}"
+
+          if [ "$remote_target_sha" != "$TRIGGER_SHA" ]; then
+            echo "::error::Remote tag $TAG no longer points to triggering SHA $TRIGGER_SHA (current target: $remote_target_sha). Refusing to overwrite it."
+            exit 1
+          fi
+
+          git tag -f "$TAG"
+          git push --force-with-lease="refs/tags/$TAG:$remote_ref_sha" origin "refs/tags/$TAG:refs/tags/$TAG"

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: build + test + lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Require changie fragment
+        if: github.event_name == 'pull_request'
+        run: bun run changelog:check -- --range "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+
+      - name: Verify extension metadata version is in sync
+        run: bun run version:check
+
+      - name: Lint + format check
+        run: bun run check
+
+      - name: Build theme
+        run: bun run build
+
+      - name: Verify generated theme is in sync with sources
+        run: git diff --exit-code themes/
+
+      - name: Run tests
+        run: bun test
